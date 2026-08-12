@@ -30,6 +30,25 @@ from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Tiny HTTP server to pass Render's free Web Service health checks
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_health_check_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# Start the health check server in a background thread
+threading.Thread(target=run_health_check_server, daemon=True).start()
 
 load_dotenv()
 
