@@ -1,0 +1,35 @@
+{
+  "groups": {
+    "general": {
+      "1505137326702067734": {
+        "language": "English",
+        "webhook_url": "https://discord.com/api/webhooks/1537132343951622314/xS3Xk0T8pPMg1StrBwAXJzQPmFe2mzaAW1-VtHd04fQM75164VnNfBBNOjSsOxtYICth"
+      },
+      "1506800513402933288": {
+        "language": "Spanish",
+        "webhook_url": "https://discord.com/api/webhooks/1537132455667175435/7dJXpY-5f8qCXHRm5l8DKTgmTYaWiJOuOUE56WhuOYZhTAj30bXw_CDaLL-JD-FZ5kZ9"
+      },
+      "1516889257732735079": {
+        "language": "English",
+        "webhook_url": "https://discord.com/api/webhooks/1537158058243915906/cxAe2FR-d7LRcLP0Ka24fS5Tvf4wGEr6ouUaDKzAdEo1Agk_qEiLfXhOvd2kDR1XP-l0"
+      },
+      "1537157985439191172": {
+        "language": "Spanish",
+        "webhook_url": "https://discord.com/api/webhooks/1537158216767770734/xwU6zbOrgVC75ePDMnBkSs0tZPYwzYwCN7uJaPLMFhtzfwOkLSTs_DjAU2-BuzFZV_z_"
+      }
+    },
+    "chatter": {
+      "1537161276793294940": {
+        "guild_id": 1516889256553873659,
+        "language": "English",
+        "webhook_url": "https://discord.com/api/webhooks/1537161394036801697/ODNwGuKXquKqMhvXb_r-LfbiXXAwLiY3kq2M9V4DPNp67fOXBEbEp3w-7zhgS1LJQwSd"
+      },
+      "1537161305067233361": {
+        "guild_id": 1516889256553873659,
+        "language": "Spanish",
+        "webhook_url": "https://discord.com/api/webhooks/1537161472679874572/m-BKxzk1cVO2iVZ5WeXE10vBXHCueq4w5_9b47Iq946V2ACp6Kp-EvTiYTgs2vCTyKEo"
+      }
+    }
+  },
+  "user_auto": {}
+}
