@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
-
+import random
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -1300,6 +1300,8 @@ def register_commands(bot: TranslatorBot) -> None:
         name="status", description="Check the status of Storm Translator."
     )
     async def status_command(interaction: discord.Interaction) -> None:
+        import random
+
         messages = [
             "Online, active, and keeping our channels connected in memory of Storm ❤️",
             "Good dogs leave paw prints on our hearts forever. Ready to translate!",
