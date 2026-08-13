@@ -5,7 +5,7 @@ The bot supports:
 * Automatic translation between configured language channels via webhooks (isolated per server).
 * Same-channel translation when messages are sent in a language different from the channel's default.
 * /translate, /detect, /channel-link, /channel-unlink, /channel-groups,
-  /user-auto, and /user-stop slash commands.
+  /user-auto, /user-stop, and /status slash commands.
 
 Configuration is loaded from environment variables (or a local .env file).
 """
@@ -17,8 +17,11 @@ import itertools
 import json
 import logging
 import os
+import random
 import re
+import threading
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,10 +32,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
-import random
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
 
 # Tiny HTTP server to pass Render's free Web Service health checks
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -42,10 +42,12 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
 
+
 def run_health_check_server():
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
+
 
 # Start the health check server in a background thread
 threading.Thread(target=run_health_check_server, daemon=True).start()
@@ -60,7 +62,6 @@ logging.basicConfig(
 
 GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "llama-3.1-8b-instant"
-# Discord rejects webhook usernames containing the word "discord".
 WEBHOOK_NAME = "Translator Mirror"
 MAX_MESSAGE_LENGTH = 2_000
 MAX_EMBED_DESCRIPTION = 4_096
@@ -165,7 +166,6 @@ LANGUAGE_ALIASES: dict[str, str] = {
 
 
 def canonical_language(value: str) -> str:
-    """Return a stable display name while allowing codes in configuration."""
     cleaned = value.strip()
     return LANGUAGE_ALIASES.get(cleaned.casefold(), cleaned.title())
 
@@ -206,14 +206,22 @@ class LinkedChannel:
 
 
 class ConfigStore:
-    """Persistent channel and user-auto configuration backed by config.json."""
-
     def __init__(self, path: Path):
         self.path = path
         self._lock = asyncio.Lock()
         self._data = self._load()
 
     def _load(self) -> dict[str, Any]:
+        env_config = os.getenv("CONFIG_JSON_DATA", "").strip()
+        if env_config:
+            try:
+                data = json.loads(env_config)
+                data.setdefault("groups", {})
+                data.setdefault("user_auto", {})
+                return data
+            except json.JSONDecodeError:
+                LOGGER.error("Failed to parse CONFIG_JSON_DATA from env variable.")
+
         if not self.path.exists():
             return {"groups": {}, "user_auto": {}}
 
@@ -224,10 +232,6 @@ class ConfigStore:
 
         if not isinstance(data, dict):
             raise RuntimeError(f"{self.path} must contain a JSON object")
-        if not isinstance(data.get("groups", {}), dict):
-            raise RuntimeError(f"{self.path}.groups must be a JSON object")
-        if not isinstance(data.get("user_auto", {}), dict):
-            raise RuntimeError(f"{self.path}.user_auto must be a JSON object")
         data.setdefault("groups", {})
         data.setdefault("user_auto", {})
         return data
@@ -402,7 +406,6 @@ class ConfigStore:
 
 
 def clean_json_response(value: str) -> str:
-    """Remove accidental fences and isolate the JSON object."""
     cleaned = value.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
@@ -424,7 +427,6 @@ def parse_provider_json(value: str) -> dict[str, Any]:
 
 
 def chunk_text(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split long translations at a natural boundary for Discord."""
     if len(text) <= limit:
         return [text]
 
@@ -450,7 +452,6 @@ def clipped_embed_text(text: str) -> str:
 
 
 def format_reply_header_standalone(referenced_message: discord.Message) -> str:
-    """Build a clickable nvu.io-style quote header for a Discord reply."""
     user_mention = f"<@{referenced_message.author.id}>"
 
     snippet = " ".join(referenced_message.content.replace("\n", " ").split())
@@ -466,13 +467,10 @@ def format_reply_header_standalone(referenced_message: discord.Message) -> str:
             snippet = "message"
 
     message_jump_url = referenced_message.jump_url
-
     return f"> {user_mention} ⇄ [**REPLY**]({message_jump_url}) *{snippet}*\n"
 
 
 class TranslationProviderPool:
-    """Gemini key pool with Groq fallback and structured JSON responses."""
-
     def __init__(self, gemini_keys: Iterable[str], groq_api_key: str):
         self._gemini_clients = [
             genai.Client(api_key=api_key) for api_key in gemini_keys
@@ -629,8 +627,6 @@ Text to identify:
 
 
 class WebhookManager:
-    """Find or create bot-owned webhooks and cache them by channel ID."""
-
     def __init__(self, bot: discord.Client, config_store: ConfigStore):
         self.bot = bot
         self.config_store = config_store
@@ -735,15 +731,17 @@ class TranslatorBot(discord.Client):
 
     async def setup_hook(self) -> None:
         if not self._synced:
-            # Replace YOUR_GUILD_ID with your Discord Server ID (integer)
-            TEST_GUILD = discord.Object(id=YOUR_GUILD_ID) 
-            
-            # Copy global commands to your test server for instant registration
-            self.tree.copy_global_to(guild=TEST_GUILD)
-            synced_commands = await self.tree.sync(guild=TEST_GUILD)
-            
+            # Check if optional TEST_GUILD_ID is provided for instant command registration
+            test_guild_id = os.getenv("TEST_GUILD_ID", "").strip()
+            if test_guild_id.isdigit():
+                guild_obj = discord.Object(id=int(test_guild_id))
+                self.tree.copy_global_to(guild=guild_obj)
+                synced_commands = await self.tree.sync(guild=guild_obj)
+                LOGGER.info("Instantly synced %d commands to guild ID %s", len(synced_commands), test_guild_id)
+            else:
+                synced_commands = await self.tree.sync()
+                LOGGER.info("Synced %d global commands", len(synced_commands))
             self._synced = True
-            LOGGER.info("Instantly synced %d slash commands to test guild!", len(synced_commands))
 
     async def close(self) -> None:
         await self.provider_pool.close()
@@ -772,7 +770,6 @@ class TranslatorBot(discord.Client):
             LOGGER.exception("Failed to mirror message %s", message.id)
 
     async def get_reply_header_for_message(self, message: discord.Message) -> str:
-        """Resolve referenced message and return formatted reply header without translating it."""
         reference = message.reference
         if reference is None or reference.message_id is None:
             return ""
@@ -805,12 +802,10 @@ class TranslatorBot(discord.Client):
         if registration is None:
             return
 
-        # 1. Detect source language of the incoming message
         source_language = await self.provider_pool.detect(raw_content)
         normalized_source = canonical_language(source_language)
         channel_language = canonical_language(registration.language)
 
-        # 2. Collect ALL channels in the group
         all_group_channels = self.config_store.get_group(
             registration.group_name, guild_id=message.guild.id
         )
@@ -818,42 +813,34 @@ class TranslatorBot(discord.Client):
         target_channels: list[tuple[LinkedChannel, bool]] = []
         languages_to_translate: set[str] = set()
 
-        # Check source channel first: Does it need same-channel translation?
         if normalized_source != channel_language:
             target_channels.append((registration, True))
             languages_to_translate.add(channel_language)
 
-        # Check other channels in the group
         for linked in all_group_channels:
             if linked.channel_id == registration.channel_id:
                 continue
 
             target_lang = canonical_language(linked.language)
             if target_lang == normalized_source:
-                # Same language -> mirror original text directly
                 target_channels.append((linked, False))
             else:
-                # Different language -> requires translation
                 target_channels.append((linked, True))
                 languages_to_translate.add(target_lang)
 
         if not target_channels:
             return
 
-        # 3. Batch translate only for languages that need translation
         translations: dict[str, str] = {}
         if languages_to_translate:
             translations = await self.provider_pool.batch_translate(
                 raw_content, list(languages_to_translate)
             )
 
-        # 4. Fetch untranslated reply header
         reply_header = await self.get_reply_header_for_message(message)
-
         author_name = f"{message.author.display_name} ({source_language})"
         avatar_url = str(message.author.display_avatar.url)
 
-        # 5. Dispatch messages via webhooks
         for linked, needs_translation in target_channels:
             target_lang = canonical_language(linked.language)
 
@@ -886,14 +873,29 @@ class TranslatorBot(discord.Client):
 
             final_text = f"{reply_header}{body_text}"
 
-            for chunk in chunk_text(final_text):
-                await webhook.send(
-                    content=chunk,
-                    username=author_name[:80],
-                    avatar_url=avatar_url,
-                    wait=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+            try:
+                for chunk in chunk_text(final_text):
+                    await webhook.send(
+                        content=chunk,
+                        username=author_name[:80],
+                        avatar_url=avatar_url,
+                        wait=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except discord.NotFound:
+                LOGGER.warning("Webhook for channel %s was deleted. Recreating...", linked.channel_id)
+                self.webhooks._cache.pop(linked.channel_id, None)
+                webhook = await self.webhooks.get_for_channel(
+                    target_channel, persisted_url=None, persist=True
                 )
+                for chunk in chunk_text(final_text):
+                    await webhook.send(
+                        content=chunk,
+                        username=author_name[:80],
+                        avatar_url=avatar_url,
+                        wait=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
 
     async def auto_translate_user_message(self, message: discord.Message) -> None:
         target_language = self.config_store.get_user_auto_language(message.author.id)
@@ -1011,12 +1013,15 @@ def register_commands(bot: TranslatorBot) -> None:
         *,
         embed: discord.Embed | None = None,
     ) -> None:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, embed=embed, ephemeral=True)
-        else:
-            await interaction.response.send_message(
-                content, embed=embed, ephemeral=True
-            )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(content, embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    content, embed=embed, ephemeral=True
+                )
+        except discord.NotFound:
+            LOGGER.warning("Interaction %s expired before response could be sent.", interaction.id)
 
     async def command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -1040,6 +1045,32 @@ def register_commands(bot: TranslatorBot) -> None:
         )
 
     bot.tree.on_error = command_error
+
+    @bot.tree.command(
+        name="status", description="Check the status of Storm Translator."
+    )
+    async def status_command(interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+
+        messages = [
+            "Online, active, and keeping our channels connected in memory of Storm ❤️",
+            "Good dogs leave paw prints on our hearts forever. Ready to translate!",
+            "Translating across channels to keep everyone together—just like a good companion 🐾",
+            "Storm Translator is online and watching over all server conversations ✨",
+            "Keeping all our language channels linked in honor of Storm 💙",
+            "Always here, bridging languages and bringing people closer in Storm's memory 🐶",
+            "A loyal companion for all our server conversations, active and ready!",
+            "Forever part of our community—Storm Translator is online and connected 🌟",
+            "Running smoothly and keeping every channel in sync for everyone ❤️",
+        ]
+        selected_message = random.choice(messages)
+        embed = discord.Embed(
+            title="🐾 Storm Translator",
+            description=selected_message,
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Translating messages across all server channels.")
+        await interaction.followup.send(embed=embed)
 
     @bot.tree.command(
         name="channel-link",
@@ -1302,35 +1333,6 @@ def register_commands(bot: TranslatorBot) -> None:
                 "Language detection is temporarily unavailable. Please try again shortly.",
                 ephemeral=True,
             )
-    @bot.tree.command(
-        name="status", description="Check the status of Storm Translator."
-    )
-    async def status_command(interaction: discord.Interaction) -> None:
-        import random
-
-        messages = [
-            "Online, active, and keeping our channels connected in memory of Storm ❤️",
-            "Good dogs leave paw prints on our hearts forever. Ready to translate!",
-            "Translating across channels to keep everyone together—just like a good companion 🐾",
-            "Storm Translator is online and watching over all server conversations ✨",
-            "Keeping all our language channels linked in honor of Storm 💙",
-            "Always here, bridging languages and bringing people closer in Storm's memory 🐶",
-            "A loyal companion for all our server conversations, active and ready!",
-            "Forever part of our community—Storm Translator is online and connected 🌟",
-            "Running smoothly and keeping every channel in sync for everyone ❤️",
-        ]
-        selected_message = random.choice(messages)
-        embed = discord.Embed(
-            title="🐾 Storm Translator",
-            description=selected_message,
-            color=discord.Color.blue(),
-        )
-        embed.set_footer(text="Translating messages across all server channels.")
-        await interaction.response.send_message(embed=embed)
-
-
-
-
 
 
 def build_bot() -> TranslatorBot:
