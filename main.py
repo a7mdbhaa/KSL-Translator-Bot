@@ -5,7 +5,7 @@ The bot supports:
 * Automatic translation between configured language channels via webhooks (isolated per server).
 * Same-channel translation when messages are sent in a language different from the channel's default.
 * /translate, /detect, /channel-link, /channel-unlink, /channel-groups,
-  /user-auto, and /user-stop slash commands.
+  /user-auto, /user-stop, and /status slash commands.
 
 Configuration is loaded from environment variables (or a local .env file).
 """
@@ -17,8 +17,11 @@ import itertools
 import json
 import logging
 import os
+import random
 import re
+import threading
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,9 +33,6 @@ from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Tiny HTTP server to pass Render's free Web Service health checks
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -42,14 +42,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
 
+
 def run_health_check_server():
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
+
 # Start the health check server in a background thread
 threading.Thread(target=run_health_check_server, daemon=True).start()
-import random
 
 STORM_MESSAGES = [
     "Online, active, and keeping our channels connected in memory of Storm ❤️",
@@ -60,22 +61,10 @@ STORM_MESSAGES = [
     "Always here, bridging languages and bringing people closer in Storm's memory 🐶",
     "A loyal companion for all our server conversations, active and ready!",
     "Forever part of our community—Storm Translator is online and connected 🌟",
-    "Running smoothly and keeping every channel in sync for everyone ❤️"
+    "Running smoothly and keeping every channel in sync for everyone ❤️",
 ]
 
-@bot.tree.command(name="status", description="Check the status of Storm Translator.")
-async def status(interaction: discord.Interaction):
-    selected_message = random.choice(STORM_MESSAGES)
-    
-    embed = discord.Embed(
-        title="🐾 Storm Translator",
-        description=selected_message,
-        color=discord.Color.blue()
-    )
-    embed.set_footer(text="Translating messages across all server channels.")
-    
-    await interaction.response.send_message(embed=embed)
-  
+
 load_dotenv()
 
 LOGGER = logging.getLogger("discord_translator")
@@ -1060,6 +1049,19 @@ def register_commands(bot: TranslatorBot) -> None:
         )
 
     bot.tree.on_error = command_error
+
+    @bot.tree.command(
+        name="status", description="Check the status of Storm Translator."
+    )
+    async def status_command(interaction: discord.Interaction) -> None:
+        selected_message = random.choice(STORM_MESSAGES)
+        embed = discord.Embed(
+            title="🐾 Storm Translator",
+            description=selected_message,
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Translating messages across all server channels.")
+        await interaction.response.send_message(embed=embed)
 
     @bot.tree.command(
         name="channel-link",
