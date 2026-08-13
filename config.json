@@ -29,6 +29,187 @@
         "language": "Spanish",
         "webhook_url": "https://discord.com/api/webhooks/1537161472679874572/m-BKxzk1cVO2iVZ5WeXE10vBXHCueq4w5_9b47Iq946V2ACp6Kp-EvTiYTgs2vCTyKEo"
       }
+    },
+    "daily": {
+      "1524258700192120923": {
+        "guild_id": 1524258699319840849,
+        "language": "English",
+        "webhook_url": "https://discord.com/api/webhooks/1537308204172574822/rMGT99wWMXdkFPGVb9-5qqlSgEePLvQRlrhezEeSpnwqlJSPQMKG8T-yZ2QoPbntxA5U"
+      },
+      "1529468141623836702": {
+        "guild_id": 1524258699319840849,
+        "language": "Spanish",
+        "webhook_url": "https://discord.com/api/webhooks/1537308225966444555/3DgDTxSg1_szWkZRnOmxESE9LKD89yhLMiQ2d8xRiV0mT1V-OSWCmSmUwIMsCHZjD3q1"
+      },
+      "1529470883570389082": {
+        "guild_id": 1524258699319840849,
+        "language": "French",
+        "webhook_url": "https://discord.com/api/webhooks/1537309069725925446/WL74b4pJPz6S6tyh3urSVdNcj0o1tRmvrvUyWcKRfpc_kuA9dcRZX6J4HoEbmRqtpf2E"
+      },
+      "1529471261280043009": {
+        "guild_id": 1524258699319840849,
+        "language": "Hindi",
+        "webhook_url": "https://discord.com/api/webhooks/1537309105549742161/Hb4szPwhH_oKPdmJYCW7OV96CoSxxU6-lBdk1kg4DWUQ7NfD3bk4KQNhDXz1jnkSLdGi"
+      },
+      "1529471600028553226": {
+        "guild_id": 1524258699319840849,
+        "language": "Indonesian",
+        "webhook_url": "https://discord.com/api/webhooks/1537305114203922494/0yrMrfH4TqyU1KEuf6roeXnXnTATuRpXU3RL06c1znrUb77bIViuFG0vTtmId_rX0uuq"
+      },
+      "1529471914542895175": {
+        "guild_id": 1524258699319840849,
+        "language": "Portuguese",
+        "webhook_url": "https://discord.com/api/webhooks/1537305140732629072/kCFxGjWw-UjdIrSFHYPqVeq4jeigehOYwNAymsxMWkql9dBLW8Yd52hjBN-Y_l48dOjJ"
+      },
+      "1529472272539058349": {
+        "guild_id": 1524258699319840849,
+        "language": "Thai",
+        "webhook_url": "https://discord.com/api/webhooks/1537305178540220508/WSJisTm-u2pVoVFwQa8qEOFF-rkcSiOykKfyhA7KJouXH8WzbeSetvEQ7ZXBcTk7wcFr"
+      },
+      "1529472405893025834": {
+        "guild_id": 1524258699319840849,
+        "language": "Bulgarian",
+        "webhook_url": "https://discord.com/api/webhooks/1537309236466548867/PRXogvMmfw7fBVM8dqT0gUnxUYTGvi14QqIqNGX0jy6f7NKLCn5pdmX4xxudmecVWNhJ"
+      },
+      "1529474960396128447": {
+        "guild_id": 1524258699319840849,
+        "language": "Chinese",
+        "webhook_url": "https://discord.com/api/webhooks/1537305211192877056/3WUG-XMkpMj8EPKEWFgVapTNuEW4mZfyr9ArzzDtkOHcq98zEooSTKNokXhfCWlxXAr4"
+      },
+      "1529483488213078076": {
+        "guild_id": 1524258699319840849,
+        "language": "Korean",
+        "webhook_url": "https://discord.com/api/webhooks/1537305243577094154/e2P4HQmaJb7QklOZ2NNQnD0ajtGE7xxyaSZL_p__KZ7mwxXnx2RW0MKGOVebuw5x5SBW"
+      },
+      "1529613274306445423": {
+        "guild_id": 1524258699319840849,
+        "language": "Nepali",
+        "webhook_url": "https://discord.com/api/webhooks/1537305304142839888/Zze0lGNtszEwd2VjY5YIZUlksF0LOlS2C8iYDa47XY9kwPXVf8DWRZjoxeT1iCdi1pno"
+      }
+    },
+    "emergency": {
+      "1524329807004041266": {
+        "guild_id": 1524258699319840849,
+        "language": "English",
+        "webhook_url": "https://discord.com/api/webhooks/1537309748712570980/Q0NUkVAxhBHXytj6R36aiA9-w6NL_zOcB4W0QtUn2h7YPNPJo6kqm_LuOXl5tFr8GACm"
+      },
+      "1529618896963899422": {
+        "guild_id": 1524258699319840849,
+        "language": "Spanish",
+        "webhook_url": "https://discord.com/api/webhooks/1537309758703271976/tV9CTkI8gnTPG0Fq29ewoTXEqdDRkKpuBTzRczw38iiBTKlrZSFAaSJNj5kP0F3IlZBz"
+      },
+      "1529618791582011572": {
+        "guild_id": 1524258699319840849,
+        "language": "French",
+        "webhook_url": "https://discord.com/api/webhooks/1537309859400261724/Qt-sB-C212ALRDfl2eGkvgk4aX8uw1dYZQe_1PABy1mWlwkbQk5lTd0gTzJOMte34Lrt"
+      },
+      "1529618692709810206": {
+        "guild_id": 1524258699319840849,
+        "language": "Hindi",
+        "webhook_url": "https://discord.com/api/webhooks/1537309905537470484/gz3g5-ToTKiO7jXT4W9Gvv_eFXoh2K47RJBeWNqlcOJ-gcZ1TIx1wpk7axZX1x9fuLs7"
+      },
+      "1529618633473659053": {
+        "guild_id": 1524258699319840849,
+        "language": "Indonesian",
+        "webhook_url": "https://discord.com/api/webhooks/1537309943957430322/uddPDa_f83ym48icpLsd1cUpeX58ujqgX6PVJ5wGCx0p-ZE_kSAYR1mVUlEpdWxN6nbO"
+      },
+      "1529618575118045195": {
+        "guild_id": 1524258699319840849,
+        "language": "Portuguese",
+        "webhook_url": "https://discord.com/api/webhooks/1537309979638370386/iETGnAJnKgKTGdH4UVDWHbCQ1MLHv1Hkc6iNW5YCf4sf42YVfReBIGqjQAuq5Y43XEoR"
+      },
+      "1529618508504240288": {
+        "guild_id": 1524258699319840849,
+        "language": "Thai",
+        "webhook_url": "https://discord.com/api/webhooks/1537310024240599083/Ywm_M0dm7YxMCpzKE-PAihwu4kko7w-155qYi8rlJPevMXlzu31856KGg_jVHZZ7FcNz"
+      },
+      "1529618463591632966": {
+        "guild_id": 1524258699319840849,
+        "language": "Bulgarian",
+        "webhook_url": "https://discord.com/api/webhooks/1537310041978445915/LLWBz_oatSZYABAyWv0spdPuTVK-XdeBKrwFIxL0H7D7qdg5AW5YX2-n9WHbvqCG-W-Y"
+      },
+      "1529618406205161693": {
+        "guild_id": 1524258699319840849,
+        "language": "Chinese",
+        "webhook_url": "https://discord.com/api/webhooks/1537310111519744000/E10ZU0x3Px51Ki26fDH8Ed8fm2rWWwpIHqZ29Z7v4wW48DdgGtNt0AqXA9SD5G5myIQu"
+      },
+      "1529618342673907744": {
+        "guild_id": 1524258699319840849,
+        "language": "Korean",
+        "webhook_url": "https://discord.com/api/webhooks/1537310130180329562/sIeUhGDXLQtgThfZZqQqantXDtbKpddtiiTqITvNgP6oAF95LKkFGzS1Zdm2vIYel7O8"
+      },
+      "1529618295894839487": {
+        "guild_id": 1524258699319840849,
+        "language": "Polish",
+        "webhook_url": "https://discord.com/api/webhooks/1537310150694539284/YET-c3Jb3cJFVpGZoMzUVEObkSdl1vrAIY-_U5dwzyVIAlsw6wE5d7mkxE4tQujah9Ou"
+      },
+      "1529613579395928084": {
+        "guild_id": 1524258699319840849,
+        "language": "Nepali",
+        "webhook_url": "https://discord.com/api/webhooks/1537310196055937146/mzi5uTbq1wfKE7fNq7NnTvyVB0qZth7Jq2NByGnP0Ol2owSmv9o0aPXTsD-d-YvPhGH1"
+      }
+    },
+    "Game-Chatter": {
+      "1524258700192120924": {
+        "guild_id": 1524258699319840849,
+        "language": "English",
+        "webhook_url": "https://discord.com/api/webhooks/1537310234576687158/Y3TAOw3FfqYEffNqJkrzxL-ciDVv4t-g74e7Yy9iIqqvQn-WTEi-G2acM2HGTgDzI2LQ"
+      },
+      "1529469038517030954": {
+        "guild_id": 1524258699319840849,
+        "language": "Spanish",
+        "webhook_url": "https://discord.com/api/webhooks/1537310275626078219/5sw7-H7iL7ZzpTUu_FVptlPvWBc9Sps1UBZ4sIBbvRzOb0yoq1cvKVIz6ZAhb9gaw5AD"
+      },
+      "1529470974070751252": {
+        "guild_id": 1524258699319840849,
+        "language": "French",
+        "webhook_url": "https://discord.com/api/webhooks/1537310284052693106/k0U7uOUQB3CRDY7XmwyX6B4mmdt4lNMXte88LmDn2zFSvyfpWOKZuU51CwnowYWFA0vy"
+      },
+      "1529471345069522995": {
+        "guild_id": 1524258699319840849,
+        "language": "Hindi",
+        "webhook_url": "https://discord.com/api/webhooks/1537310309256138833/790Jy-hhRGYdZFW00WL8CY8jJlYBxE_QjkHcpIfSsFwRbKzZkT_8rWEr9pBD-aQC2SAP"
+      },
+      "1529471505593925732": {
+        "guild_id": 1524258699319840849,
+        "language": "Indonesian",
+        "webhook_url": "https://discord.com/api/webhooks/1537310402726199388/TpvKNAvFZGwaEc4MB91rPKCH0zWr686U77ENdCdOzOvGdznvCgwo3TNpzYMSjtOeTqev"
+      },
+      "1529472000463077546": {
+        "guild_id": 1524258699319840849,
+        "language": "Portuguese",
+        "webhook_url": "https://discord.com/api/webhooks/1537310391976206336/2T7UYr-JdbRePIY-yNd1Uhe5m9nuOcEKcFiKLlAL5K2Is-MKf3_q2-dRtmyS_t9volcG"
+      },
+      "1529472187512131726": {
+        "guild_id": 1524258699319840849,
+        "language": "Thai",
+        "webhook_url": "https://discord.com/api/webhooks/1537310438096637952/sGQvuhILsldNJX7V_3xjq187qz8gSJl8SPYMmIz9vxkjhOqioVZUSNqKjisvQVJixAkh"
+      },
+      "1529472522754588734": {
+        "guild_id": 1524258699319840849,
+        "language": "Bulgarian",
+        "webhook_url": "https://discord.com/api/webhooks/1537310458850050120/mq7gZoWh-rmsD8zAnYGwxF3ENTbOPweLIpgMh4XXEv0LOIRSFBena62iDfGz3sMdKafL"
+      },
+      "1529473501092642967": {
+        "guild_id": 1524258699319840849,
+        "language": "Chinese",
+        "webhook_url": "https://discord.com/api/webhooks/1537310495160279082/mIGTuwGuEO5Kq30kE-enXnJonsiIG1UhW4mxdrOrw-J2fgQwZbVd0PKzw6qIyeQPCoTM"
+      },
+      "1529483427328557226": {
+        "guild_id": 1524258699319840849,
+        "language": "Korean",
+        "webhook_url": "https://discord.com/api/webhooks/1537310575976124566/yMsjudbQxbsLX8IpWk6PeB3JktVe43h7Or6QMKShSq5aVXhvrWeyFwIGs8uDwDpYaksX"
+      },
+      "1529612625846206656": {
+        "guild_id": 1524258699319840849,
+        "language": "Polish",
+        "webhook_url": "https://discord.com/api/webhooks/1537305275650936843/ZrDJG9ih3j5HfJCQzzQBswlwB8_GAV0NhA_roJK5YJ7BoW6GEAO4AtR3H0t54gHAkkju"
+      },
+      "1529613221219274862": {
+        "guild_id": 1524258699319840849,
+        "language": "Nepali",
+        "webhook_url": "https://discord.com/api/webhooks/1537310659270938715/6nJ2rynBVtSdsX7GsxZQfsaBKDtYOj1pPAPhj49Udd515ULVPIuRsMLCFjJ94gCZSPva"
+      }
     }
   },
   "user_auto": {}
