@@ -735,9 +735,15 @@ class TranslatorBot(discord.Client):
 
     async def setup_hook(self) -> None:
         if not self._synced:
-            synced_commands = await self.tree.sync()
+            # Replace YOUR_GUILD_ID with your Discord Server ID (integer)
+            TEST_GUILD = discord.Object(id=YOUR_GUILD_ID) 
+            
+            # Copy global commands to your test server for instant registration
+            self.tree.copy_global_to(guild=TEST_GUILD)
+            synced_commands = await self.tree.sync(guild=TEST_GUILD)
+            
             self._synced = True
-            LOGGER.info("Synced %d slash commands", len(synced_commands))
+            LOGGER.info("Instantly synced %d slash commands to test guild!", len(synced_commands))
 
     async def close(self) -> None:
         await self.provider_pool.close()
