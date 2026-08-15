@@ -1,13 +1,13 @@
 """Production-ready Discord translator bot.
 
-The bot supports:
-* Flag reactions that DM a translation to the reacting user.
-* Automatic translation between configured language channels via webhooks (isolated per server).
-* Same-channel translation when messages are sent in a language different from the channel's default.
+Features:
+* Flag reactions DM a translation to the reacting user.
+* Automatic translation between configured language channels via webhooks.
+* Same-channel translation when messages differ from a channel's default language.
 * /translate, /detect, /channel-link, /channel-unlink, /channel-groups,
   /user-auto, and /user-stop slash commands.
-
-Configuration is loaded from environment variables (or a local .env file).
+* Gemini provider pool with Groq fallback.
+* Resilient batching, partial-success handling, and Discord-safe message/embed splitting.
 """
 
 from __future__ import annotations
@@ -18,7 +18,10 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,26 +32,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
-import random
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Tiny HTTP server to pass Render's free Web Service health checks
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
 
-def run_health_check_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
-
-# Start the health check server in a background thread
-threading.Thread(target=run_health_check_server, daemon=True).start()
+# ---------------------------------------------------------------------------
+# Environment / logging
+# ---------------------------------------------------------------------------
 
 load_dotenv()
 
@@ -58,13 +46,26 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-GEMINI_MODEL = "gemini-2.5-flash"
-GROQ_MODEL = "llama-3.1-8b-instant"
-# Discord rejects webhook usernames containing the word "discord".
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
 WEBHOOK_NAME = "Translator Mirror"
 MAX_MESSAGE_LENGTH = 2_000
 MAX_EMBED_DESCRIPTION = 4_096
-LLM_TIMEOUT_SECONDS = 45
+MAX_EMBED_FIELD_VALUE = 1_024
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
+
+GEMINI_COOLDOWN_SECONDS = float(
+    os.getenv("GEMINI_COOLDOWN_SECONDS", "60")
+)
+GROQ_MAX_COMPLETION_TOKENS = int(
+    os.getenv("GROQ_MAX_COMPLETION_TOKENS", "4096")
+)
+MAX_TRANSLATION_BATCH_SIZE = int(
+    os.getenv("MAX_TRANSLATION_BATCH_SIZE", "3")
+)
+
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config.json"))
 
 SYSTEM_PROMPT = """You are a careful Discord translation engine.
 
@@ -78,6 +79,39 @@ Preservation rules:
   code fences around the translated text.
 - Return valid JSON matching the requested schema.
 """
+
+
+# ---------------------------------------------------------------------------
+# Render health-check server
+# ---------------------------------------------------------------------------
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def run_health_check_server() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    LOGGER.info("Health check server listening on port %s", port)
+    server.serve_forever()
+
+
+threading.Thread(
+    target=run_health_check_server,
+    daemon=True,
+).start()
+
+
+# ---------------------------------------------------------------------------
+# Languages
+# ---------------------------------------------------------------------------
 
 FLAG_LANGUAGES: dict[str, str] = {
     "🇪🇸": "Spanish",
@@ -108,70 +142,52 @@ FLAG_LANGUAGES: dict[str, str] = {
     "🇹🇭": "Thai",
     "🇮🇱": "Hebrew",
     "🇺🇦": "Ukrainian",
+    "🇳🇵": "Nepali",
 }
 
 LANGUAGE_ALIASES: dict[str, str] = {
-    "ar": "Arabic",
-    "arabic": "Arabic",
-    "zh": "Chinese",
-    "chinese": "Chinese",
-    "da": "Danish",
-    "danish": "Danish",
-    "nl": "Dutch",
-    "dutch": "Dutch",
-    "en": "English",
-    "english": "English",
-    "fi": "Finnish",
-    "finnish": "Finnish",
-    "fr": "French",
-    "french": "French",
-    "de": "German",
-    "german": "German",
-    "el": "Greek",
-    "greek": "Greek",
-    "he": "Hebrew",
-    "hebrew": "Hebrew",
-    "hi": "Hindi",
-    "hindi": "Hindi",
-    "id": "Indonesian",
-    "indonesian": "Indonesian",
-    "it": "Italian",
-    "italian": "Italian",
-    "ja": "Japanese",
-    "japanese": "Japanese",
-    "ko": "Korean",
-    "korean": "Korean",
-    "no": "Norwegian",
-    "norwegian": "Norwegian",
-    "pl": "Polish",
-    "polish": "Polish",
-    "pt": "Portuguese",
-    "portuguese": "Portuguese",
-    "ru": "Russian",
-    "russian": "Russian",
-    "es": "Spanish",
-    "spanish": "Spanish",
-    "sv": "Swedish",
-    "swedish": "Swedish",
-    "th": "Thai",
-    "thai": "Thai",
-    "tr": "Turkish",
-    "turkish": "Turkish",
-    "uk": "Ukrainian",
-    "ukrainian": "Ukrainian",
-    "vi": "Vietnamese",
-    "vietnamese": "Vietnamese",
+    "ar": "Arabic", "arabic": "Arabic",
+    "zh": "Chinese", "chinese": "Chinese",
+    "da": "Danish", "danish": "Danish",
+    "nl": "Dutch", "dutch": "Dutch",
+    "en": "English", "english": "English",
+    "fi": "Finnish", "finnish": "Finnish",
+    "fr": "French", "french": "French",
+    "de": "German", "german": "German",
+    "el": "Greek", "greek": "Greek",
+    "he": "Hebrew", "hebrew": "Hebrew",
+    "hi": "Hindi", "hindi": "Hindi",
+    "id": "Indonesian", "indonesian": "Indonesian",
+    "it": "Italian", "italian": "Italian",
+    "ja": "Japanese", "japanese": "Japanese",
+    "ko": "Korean", "korean": "Korean",
+    "ne": "Nepali", "nepali": "Nepali",
+    "no": "Norwegian", "norwegian": "Norwegian",
+    "pl": "Polish", "polish": "Polish",
+    "pt": "Portuguese", "portuguese": "Portuguese",
+    "ru": "Russian", "russian": "Russian",
+    "es": "Spanish", "spanish": "Spanish",
+    "sv": "Swedish", "swedish": "Swedish",
+    "th": "Thai", "thai": "Thai",
+    "tr": "Turkish", "turkish": "Turkish",
+    "uk": "Ukrainian", "ukrainian": "Ukrainian",
+    "vi": "Vietnamese", "vietnamese": "Vietnamese",
 }
 
 
 def canonical_language(value: str) -> str:
-    """Return a stable display name while allowing codes in configuration."""
     cleaned = value.strip()
     return LANGUAGE_ALIASES.get(cleaned.casefold(), cleaned.title())
 
 
-CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config.json"))
+def all_language_choices() -> list[app_commands.Choice[str]]:
+    values = sorted(set(LANGUAGE_ALIASES.values()))
+    return [app_commands.Choice(name=x, value=x) for x in values[:25]]
 
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -186,14 +202,13 @@ def parse_gemini_keys() -> list[str]:
         raw_keys = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not raw_keys:
-        raise RuntimeError("Missing required environment variable: GEMINI_API_KEYS")
+        return []
 
-    keys = [key.strip().strip("'\"") for key in raw_keys.split(",") if key.strip()]
-
-    if not keys:
-        raise RuntimeError("No valid Gemini API keys found in GEMINI_API_KEYS")
-
-    return keys
+    return [
+        key.strip().strip("'\"")
+        for key in raw_keys.split(",")
+        if key.strip()
+    ]
 
 
 @dataclass(frozen=True)
@@ -206,8 +221,6 @@ class LinkedChannel:
 
 
 class ConfigStore:
-    """Persistent channel and user-auto configuration backed by config.json."""
-
     def __init__(self, path: Path):
         self.path = path
         self._lock = asyncio.Lock()
@@ -224,12 +237,15 @@ class ConfigStore:
 
         if not isinstance(data, dict):
             raise RuntimeError(f"{self.path} must contain a JSON object")
-        if not isinstance(data.get("groups", {}), dict):
-            raise RuntimeError(f"{self.path}.groups must be a JSON object")
-        if not isinstance(data.get("user_auto", {}), dict):
-            raise RuntimeError(f"{self.path}.user_auto must be a JSON object")
+
         data.setdefault("groups", {})
         data.setdefault("user_auto", {})
+
+        if not isinstance(data["groups"], dict):
+            raise RuntimeError(f"{self.path}.groups must be a JSON object")
+        if not isinstance(data["user_auto"], dict):
+            raise RuntimeError(f"{self.path}.user_auto must be a JSON object")
+
         return data
 
     async def _save(self) -> None:
@@ -258,18 +274,22 @@ class ConfigStore:
     ) -> LinkedChannel | None:
         if not isinstance(entry, dict):
             return None
+
         language = entry.get("language")
         webhook_url = entry.get("webhook_url", "")
         guild_id = entry.get("guild_id", 0)
+
         try:
             parsed_channel_id = int(channel_id)
             parsed_guild_id = int(guild_id) if guild_id else 0
         except (TypeError, ValueError):
             return None
+
         if not isinstance(language, str) or not language.strip():
             return None
         if not isinstance(webhook_url, str):
             webhook_url = ""
+
         return LinkedChannel(
             group_name=group_name,
             channel_id=parsed_channel_id,
@@ -280,42 +300,67 @@ class ConfigStore:
 
     def get_channel(self, channel_id: int) -> LinkedChannel | None:
         channel_key = str(channel_id)
+
         for group_name, channels in self._data["groups"].items():
             if not isinstance(channels, dict):
                 continue
+
             linked = self._linked_channel_from_entry(
-                group_name, channel_key, channels.get(channel_key)
+                group_name,
+                channel_key,
+                channels.get(channel_key),
             )
             if linked is not None:
                 return linked
+
         return None
 
     def get_group(
-        self, group_name: str, guild_id: int | None = None
+        self,
+        group_name: str,
+        guild_id: int | None = None,
     ) -> list[LinkedChannel]:
         channels = self._data["groups"].get(group_name, {})
         if not isinstance(channels, dict):
             return []
+
         result: list[LinkedChannel] = []
+
         for channel_id, entry in channels.items():
-            linked = self._linked_channel_from_entry(group_name, channel_id, entry)
-            if linked is not None:
-                if (
-                    guild_id is not None
-                    and linked.guild_id != 0
-                    and linked.guild_id != guild_id
-                ):
-                    continue
-                result.append(linked)
+            linked = self._linked_channel_from_entry(
+                group_name,
+                channel_id,
+                entry,
+            )
+            if linked is None:
+                continue
+
+            if (
+                guild_id is not None
+                and linked.guild_id != 0
+                and linked.guild_id != guild_id
+            ):
+                continue
+
+            result.append(linked)
+
         return sorted(result, key=lambda item: item.channel_id)
 
-    def get_groups(self, guild_id: int | None = None) -> dict[str, list[LinkedChannel]]:
-        res: dict[str, list[LinkedChannel]] = {}
+    def get_groups(
+        self,
+        guild_id: int | None = None,
+    ) -> dict[str, list[LinkedChannel]]:
+        result: dict[str, list[LinkedChannel]] = {}
+
         for group_name in sorted(self._data["groups"]):
-            group_list = self.get_group(group_name, guild_id=guild_id)
-            if group_list:
-                res[group_name] = group_list
-        return res
+            group_channels = self.get_group(
+                group_name,
+                guild_id=guild_id,
+            )
+            if group_channels:
+                result[group_name] = group_channels
+
+        return result
 
     async def link_channel(
         self,
@@ -327,16 +372,20 @@ class ConfigStore:
     ) -> LinkedChannel:
         group_name = self.normalize_group_name(group_name)
         normalized_language = canonical_language(language)
+
         if not normalized_language:
             raise ValueError("Language cannot be empty")
 
         async with self._lock:
             groups = self._data["groups"]
+
             for existing_group in list(groups):
                 channels = groups[existing_group]
                 if not isinstance(channels, dict):
                     continue
+
                 channels.pop(str(channel_id), None)
+
                 if not channels:
                     groups.pop(existing_group, None)
 
@@ -345,71 +394,119 @@ class ConfigStore:
                 "language": normalized_language,
                 "webhook_url": webhook_url,
             }
+
             await self._save()
 
         return LinkedChannel(
-            group_name, channel_id, guild_id, normalized_language, webhook_url
+            group_name,
+            channel_id,
+            guild_id,
+            normalized_language,
+            webhook_url,
         )
 
-    async def unlink_channel(self, channel_id: int) -> list[LinkedChannel]:
+    async def unlink_channel(
+        self,
+        channel_id: int,
+    ) -> list[LinkedChannel]:
         removed: list[LinkedChannel] = []
+
         async with self._lock:
             groups = self._data["groups"]
+
             for group_name in list(groups):
                 channels = groups[group_name]
                 if not isinstance(channels, dict):
                     continue
+
                 linked = self._linked_channel_from_entry(
-                    group_name, str(channel_id), channels.get(str(channel_id))
+                    group_name,
+                    str(channel_id),
+                    channels.get(str(channel_id)),
                 )
+
                 if linked is not None:
                     removed.append(linked)
                     channels.pop(str(channel_id), None)
+
                 if not channels:
                     groups.pop(group_name, None)
+
             if removed:
                 await self._save()
+
         return removed
 
-    async def set_webhook_url(self, channel_id: int, webhook_url: str) -> None:
+    async def set_webhook_url(
+        self,
+        channel_id: int,
+        webhook_url: str,
+    ) -> None:
         async with self._lock:
             linked = self.get_channel(channel_id)
             if linked is None:
                 return
-            self._data["groups"][linked.group_name][str(channel_id)]["webhook_url"] = (
-                webhook_url
-            )
+
+            self._data["groups"][linked.group_name][
+                str(channel_id)
+            ]["webhook_url"] = webhook_url
+
             await self._save()
 
-    def get_user_auto_language(self, user_id: int) -> str | None:
+    def get_user_auto_language(
+        self,
+        user_id: int,
+    ) -> str | None:
         value = self._data["user_auto"].get(str(user_id))
         return canonical_language(value) if isinstance(value, str) else None
 
-    async def set_user_auto_language(self, user_id: int, language: str) -> str:
+    async def set_user_auto_language(
+        self,
+        user_id: int,
+        language: str,
+    ) -> str:
         normalized_language = canonical_language(language)
+
         async with self._lock:
             self._data["user_auto"][str(user_id)] = normalized_language
             await self._save()
+
         return normalized_language
 
-    async def remove_user_auto_language(self, user_id: int) -> bool:
+    async def remove_user_auto_language(
+        self,
+        user_id: int,
+    ) -> bool:
         async with self._lock:
             existed = str(user_id) in self._data["user_auto"]
             self._data["user_auto"].pop(str(user_id), None)
+
             if existed:
                 await self._save()
+
             return existed
 
 
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
 def clean_json_response(value: str) -> str:
-    """Remove accidental fences and isolate the JSON object."""
     cleaned = value.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"\s*```$", "", cleaned)
+
     start = cleaned.find("{")
     end = cleaned.rfind("}")
+
     if start == -1 or end == -1 or end < start:
         raise ValueError("Provider returned no JSON object")
+
     return cleaned[start : end + 1]
 
 
@@ -418,28 +515,38 @@ def parse_provider_json(value: str) -> dict[str, Any]:
         parsed = json.loads(clean_json_response(value))
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("Provider returned invalid JSON") from exc
+
     if not isinstance(parsed, dict):
         raise ValueError("Provider response must be a JSON object")
+
     return parsed
 
 
-def chunk_text(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split long translations at a natural boundary for Discord."""
+def chunk_text(
+    text: str,
+    limit: int = MAX_MESSAGE_LENGTH,
+) -> list[str]:
     if len(text) <= limit:
         return [text]
 
     chunks: list[str] = []
     remaining = text
+
     while len(remaining) > limit:
         split_at = remaining.rfind("\n", 0, limit + 1)
+
         if split_at < limit // 2:
             split_at = remaining.rfind(" ", 0, limit + 1)
+
         if split_at < limit // 2:
             split_at = limit
+
         chunks.append(remaining[:split_at].rstrip())
         remaining = remaining[split_at:].lstrip()
+
     if remaining:
         chunks.append(remaining)
+
     return chunks
 
 
@@ -449,11 +556,47 @@ def clipped_embed_text(text: str) -> str:
     return f"{text[: MAX_EMBED_DESCRIPTION - 1].rstrip()}…"
 
 
-def format_reply_header_standalone(referenced_message: discord.Message) -> str:
-    """Build a clickable nvu.io-style quote header for a Discord reply."""
+def batched(
+    items: list[str],
+    size: int,
+) -> Iterable[list[str]]:
+    size = max(1, size)
+
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
+
+
+def translation_batch_size(text: str) -> int:
+    if len(text) > 3000:
+        return 1
+    if len(text) > 1500:
+        return min(2, MAX_TRANSLATION_BATCH_SIZE)
+    return min(3, MAX_TRANSLATION_BATCH_SIZE)
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    code = getattr(exc, "code", None)
+    message = str(exc).upper()
+
+    return (
+        status_code == 429
+        or code == 429
+        or "429" in message
+        or "RESOURCE_EXHAUSTED" in message
+        or "TOO MANY REQUESTS" in message
+    )
+
+
+def format_reply_header_standalone(
+    referenced_message: discord.Message,
+) -> str:
     user_mention = f"<@{referenced_message.author.id}>"
 
-    snippet = " ".join(referenced_message.content.replace("\n", " ").split())
+    snippet = " ".join(
+        referenced_message.content.replace("\n", " ").split()
+    )
+
     if snippet:
         snippet = re.sub(r"https?://\S+", "", snippet).strip()
         if len(snippet) > 40:
@@ -465,34 +608,60 @@ def format_reply_header_standalone(referenced_message: discord.Message) -> str:
         else:
             snippet = "message"
 
-    message_jump_url = referenced_message.jump_url
+    return (
+        f"> {user_mention} ⇄ "
+        f"[**REPLY**]({referenced_message.jump_url}) "
+        f"*{snippet}*\n"
+    )
 
-    return f"> {user_mention} ⇄ [**REPLY**]({message_jump_url}) *{snippet}*\n"
 
+# ---------------------------------------------------------------------------
+# Translation providers
+# ---------------------------------------------------------------------------
 
 class TranslationProviderPool:
-    """Gemini key pool with Groq fallback and structured JSON responses."""
-
-    def __init__(self, gemini_keys: Iterable[str], groq_api_key: str):
+    def __init__(
+        self,
+        gemini_keys: Iterable[str],
+        groq_api_key: str,
+    ):
         self._gemini_clients = [
-            genai.Client(api_key=api_key) for api_key in gemini_keys
+            genai.Client(api_key=api_key)
+            for api_key in gemini_keys
         ]
-        if not self._gemini_clients and not groq_api_key:
-            raise RuntimeError("Configure at least one Gemini key or a Groq key")
 
-        self._gemini_cycle = itertools.cycle(range(len(self._gemini_clients)))
+        if not self._gemini_clients and not groq_api_key:
+            raise RuntimeError(
+                "Configure at least one Gemini key or a Groq key"
+            )
+
+        self._gemini_cycle = itertools.cycle(
+            range(len(self._gemini_clients))
+        )
+        self._gemini_blocked_until: list[float] = [
+            0.0 for _ in self._gemini_clients
+        ]
+
         self._groq_client = (
             AsyncOpenAI(
                 api_key=groq_api_key,
                 base_url="https://api.groq.com/openai/v1",
                 timeout=LLM_TIMEOUT_SECONDS,
+                max_retries=2,
             )
             if groq_api_key
             else None
         )
-        self.http_timeout = aiohttp.ClientTimeout(total=LLM_TIMEOUT_SECONDS)
 
-    async def _ask_gemini(self, prompt: str, client: genai.Client) -> dict[str, Any]:
+        self.http_timeout = aiohttp.ClientTimeout(
+            total=LLM_TIMEOUT_SECONDS
+        )
+
+    async def _ask_gemini(
+        self,
+        prompt: str,
+        client: genai.Client,
+    ) -> dict[str, Any]:
         def request() -> str:
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
@@ -500,7 +669,7 @@ class TranslationProviderPool:
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
-                    temperature=0.2,
+                    temperature=0.1,
                 ),
             )
             return response.text or ""
@@ -509,9 +678,13 @@ class TranslationProviderPool:
             asyncio.to_thread(request),
             timeout=self.http_timeout.total,
         )
+
         return parse_provider_json(response_text)
 
-    async def _ask_groq(self, prompt: str) -> dict[str, Any]:
+    async def _ask_groq(
+        self,
+        prompt: str,
+    ) -> dict[str, Any]:
         if self._groq_client is None:
             raise RuntimeError("Groq fallback is not configured")
 
@@ -521,34 +694,77 @@ class TranslationProviderPool:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.2,
+            temperature=0.1,
             response_format={"type": "json_object"},
+            max_completion_tokens=GROQ_MAX_COMPLETION_TOKENS,
         )
+
         content = response.choices[0].message.content or ""
         return parse_provider_json(content)
 
-    async def _ask(self, prompt: str) -> dict[str, Any]:
+    async def _ask(
+        self,
+        prompt: str,
+    ) -> dict[str, Any]:
         errors: list[str] = []
-        for _ in range(len(self._gemini_clients)):
-            client_index = next(self._gemini_cycle)
-            try:
-                return await self._ask_gemini(
-                    prompt, self._gemini_clients[client_index]
-                )
-            except Exception as exc:
-                error_name = type(exc).__name__
-                errors.append(f"Gemini[{client_index}] {error_name}")
-                LOGGER.warning("Gemini request failed: %s", error_name)
+
+        if self._gemini_clients:
+            checked_clients = 0
+
+            while checked_clients < len(self._gemini_clients):
+                client_index = next(self._gemini_cycle)
+                checked_clients += 1
+
+                if (
+                    time.monotonic()
+                    < self._gemini_blocked_until[client_index]
+                ):
+                    continue
+
+                try:
+                    return await self._ask_gemini(
+                        prompt,
+                        self._gemini_clients[client_index],
+                    )
+                except Exception as exc:
+                    error_name = type(exc).__name__
+                    errors.append(
+                        f"Gemini[{client_index}] {error_name}"
+                    )
+
+                    if is_rate_limit_error(exc):
+                        self._gemini_blocked_until[
+                            client_index
+                        ] = (
+                            time.monotonic()
+                            + GEMINI_COOLDOWN_SECONDS
+                        )
+                        LOGGER.warning(
+                            "Gemini[%s] rate limited; cooling down for %.0f seconds",
+                            client_index,
+                            GEMINI_COOLDOWN_SECONDS,
+                        )
+                    else:
+                        LOGGER.warning(
+                            "Gemini[%s] request failed: %s",
+                            client_index,
+                            error_name,
+                        )
 
         if self._groq_client is not None:
             try:
-                LOGGER.info("All Gemini clients failed; using Groq fallback")
+                LOGGER.info(
+                    "Gemini unavailable; using Groq fallback"
+                )
                 return await self._ask_groq(prompt)
             except Exception as exc:
                 errors.append(f"Groq {type(exc).__name__}")
                 LOGGER.exception("Groq fallback failed")
 
-        raise RuntimeError("All translation providers failed: " + ", ".join(errors))
+        raise RuntimeError(
+            "All translation providers failed: "
+            + ", ".join(errors)
+        )
 
     async def translate(
         self,
@@ -557,795 +773,983 @@ class TranslationProviderPool:
         source_language: str | None = None,
     ) -> str:
         target = canonical_language(target_language)
+
         source_hint = (
-            f"The source language is {canonical_language(source_language)}.\n"
+            f"The source language is "
+            f"{canonical_language(source_language)}.\n"
             if source_language
             else ""
         )
+
         payload = await self._ask(
             f"""{source_hint}Translate the following Discord message into {target}.
-Return exactly this JSON shape: {{"translation":"..."}}
+
+Return ONLY this JSON object:
+{{"translation":"<translated text>"}}
+
+Do not omit the translation field.
 
 Text to translate:
 {text}"""
         )
+
         translation = payload.get("translation")
-        if not isinstance(translation, str) or not translation.strip():
-            raise ValueError("Translation response did not include text")
+
+        if (
+            not isinstance(translation, str)
+            or not translation.strip()
+        ):
+            raise ValueError(
+                "Translation response did not include text"
+            )
+
         return translation.strip()
 
-    async def batch_translate(
-        self, text: str, target_languages: Iterable[str]
-    ) -> dict[str, str]:
-        targets = [canonical_language(language) for language in target_languages]
-        target_json = json.dumps(targets, ensure_ascii=False)
+    async def detect_language(
+        self,
+        text: str,
+    ) -> str:
         payload = await self._ask(
-            f"""Translate the following Discord message into every language in this list:
+            f"""Detect the primary human language of this Discord message.
+
+Return ONLY:
+{{"language":"<English language name>"}}
+
+Text:
+{text}"""
+        )
+
+        language = payload.get("language")
+
+        if not isinstance(language, str) or not language.strip():
+            raise ValueError(
+                "Language detection response omitted language"
+            )
+
+        return canonical_language(language)
+
+    async def _batch_translate_once(
+        self,
+        text: str,
+        target_languages: list[str],
+    ) -> dict[str, str]:
+        if not target_languages:
+            return {}
+
+        targets = [
+            canonical_language(language)
+            for language in target_languages
+        ]
+
+        target_json = json.dumps(
+            targets,
+            ensure_ascii=False,
+        )
+
+        payload = await self._ask(
+            f"""Translate the following Discord message into EVERY language in this list:
+
 {target_json}
 
-Return exactly this JSON shape:
-{{"translations":[{{"language":"<one requested language>","text":"<translation>"}}, ...]}}
+Return ONLY a JSON object in exactly this structure:
 
-Include one object for every requested language, using the requested language
-names exactly. Do not omit a language.
+{{
+  "translations": [
+    {{
+      "language": "<requested language>",
+      "text": "<translated text>"
+    }}
+  ]
+}}
+
+Requirements:
+- Include exactly one translation object for every requested language.
+- The "language" value must exactly match one requested language name.
+- Do not omit any requested language.
+- Do not add unrequested languages.
+- Do not include explanations or commentary.
 
 Text to translate:
 {text}"""
         )
-        raw_translations = payload.get("translations")
-        if not isinstance(raw_translations, list):
-            raise ValueError("Batch response did not include translations")
 
-        translations: dict[str, str] = {}
-        for item in raw_translations:
+        translations = payload.get("translations")
+
+        if not isinstance(translations, list):
+            raise ValueError(
+                "Batch response did not contain a translations list"
+            )
+
+        requested_lookup = {
+            language.casefold(): language
+            for language in targets
+        }
+
+        result: dict[str, str] = {}
+
+        for item in translations:
             if not isinstance(item, dict):
                 continue
+
             language = item.get("language")
             translated_text = item.get("text")
-            if isinstance(language, str) and isinstance(translated_text, str):
-                translations[canonical_language(language)] = translated_text.strip()
 
-        missing = [language for language in targets if language not in translations]
-        if missing:
-            raise ValueError("Batch response omitted languages: " + ", ".join(missing))
-        return {language: translations[language] for language in targets}
+            if not isinstance(language, str):
+                continue
+            if not isinstance(translated_text, str):
+                continue
+            if not translated_text.strip():
+                continue
 
-    async def detect(self, text: str) -> str:
-        payload = await self._ask(
-            f"""Identify the primary language of the following text.
-Return exactly this JSON shape: {{"language":"<language name>"}}
-
-Text to identify:
-{text}"""
-        )
-        language = payload.get("language")
-        if not isinstance(language, str) or not language.strip():
-            raise ValueError("Detection response did not include a language")
-        return canonical_language(language)
-
-    async def close(self) -> None:
-        if self._groq_client is not None:
-            await self._groq_client.close()
-
-
-class WebhookManager:
-    """Find or create bot-owned webhooks and cache them by channel ID."""
-
-    def __init__(self, bot: discord.Client, config_store: ConfigStore):
-        self.bot = bot
-        self.config_store = config_store
-        self._cache: dict[int, discord.Webhook] = {}
-        self._lock = asyncio.Lock()
-
-    async def get_for_channel(
-        self,
-        channel: discord.TextChannel,
-        persisted_url: str | None = None,
-        *,
-        persist: bool = True,
-    ) -> discord.Webhook:
-        if channel.id in self._cache:
-            return self._cache[channel.id]
-
-        async with self._lock:
-            if channel.id in self._cache:
-                return self._cache[channel.id]
-
-            if persisted_url:
-                try:
-                    persisted_webhook = discord.Webhook.from_url(
-                        persisted_url, client=self.bot
-                    )
-                    webhook = await persisted_webhook.fetch()
-                    self._cache[channel.id] = webhook
-                    return webhook
-                except discord.HTTPException:
-                    LOGGER.info(
-                        "Persisted webhook for channel %s is unavailable; repairing it",
-                        channel.id,
-                    )
-
-            webhooks = await channel.webhooks()
-            bot_user_id = self.bot.user.id if self.bot.user else None
-            webhook = next(
-                (
-                    item
-                    for item in webhooks
-                    if item.name == WEBHOOK_NAME
-                    and (item.user is None or item.user.id == bot_user_id)
-                ),
-                None,
+            normalized_language = canonical_language(language)
+            requested_language = requested_lookup.get(
+                normalized_language.casefold()
             )
-            if webhook is None:
-                webhook = await channel.create_webhook(
-                    name=WEBHOOK_NAME,
-                    reason="Create the Discord Translator mirror webhook",
+
+            if requested_language is None:
+                LOGGER.warning(
+                    "Provider returned unexpected language: %s",
+                    language,
                 )
-            self._cache[channel.id] = webhook
-            if persist:
-                await self.config_store.set_webhook_url(channel.id, str(webhook.url))
-            return webhook
+                continue
 
+            result[requested_language] = translated_text.strip()
 
-def translation_embed(
-    *,
-    translation: str,
-    target_language: str,
-    original_message: discord.Message | None = None,
-    original_text: str | None = None,
-) -> discord.Embed:
-    author = original_message.author if original_message else None
-    embed = discord.Embed(
-        title=f"Translation · {target_language}",
-        description=clipped_embed_text(translation),
-        color=discord.Color.blurple(),
-    )
-    if author is not None:
-        embed.set_author(
-            name=f"{author.display_name} ({author.name})",
-            icon_url=author.display_avatar.url,
+        return result
+
+    async def batch_translate(
+        self,
+        text: str,
+        target_languages: Iterable[str],
+    ) -> dict[str, str]:
+        targets = list(
+            dict.fromkeys(
+                canonical_language(language)
+                for language in target_languages
+                if str(language).strip()
+            )
         )
-        embed.set_footer(text=f"Requested from #{original_message.channel.name}")
-    if original_text:
-        embed.add_field(
-            name="Original",
-            value=clipped_embed_text(original_text),
-            inline=False,
-        )
-    return embed
 
+        if not targets:
+            return {}
+
+        result: dict[str, str] = {}
+        batch_size = translation_batch_size(text)
+
+        LOGGER.info(
+            "Translating into %s languages using batches of %s",
+            len(targets),
+            batch_size,
+        )
+
+        for language_batch in batched(
+            targets,
+            batch_size,
+        ):
+            batch_result: dict[str, str] = {}
+
+            try:
+                batch_result = await self._batch_translate_once(
+                    text,
+                    language_batch,
+                )
+                result.update(batch_result)
+
+            except Exception as exc:
+                LOGGER.warning(
+                    "Translation batch failed for %s: %s",
+                    ", ".join(language_batch),
+                    type(exc).__name__,
+                )
+
+            missing = [
+                language
+                for language in language_batch
+                if language not in batch_result
+            ]
+
+            if missing:
+                LOGGER.warning(
+                    "Batch omitted %s; retrying individually",
+                    ", ".join(missing),
+                )
+
+            for language in missing:
+                try:
+                    result[language] = await self.translate(
+                        text,
+                        language,
+                    )
+                except Exception as exc:
+                    LOGGER.error(
+                        "Translation permanently failed for %s: %s",
+                        language,
+                        type(exc).__name__,
+                    )
+
+        successful = len(result)
+
+        if successful != len(targets):
+            still_missing = [
+                language
+                for language in targets
+                if language not in result
+            ]
+            LOGGER.warning(
+                "Translation completed partially: %s/%s languages succeeded. "
+                "Still missing: %s",
+                successful,
+                len(targets),
+                ", ".join(still_missing),
+            )
+        else:
+            LOGGER.info(
+                "Translation completed successfully: %s/%s languages",
+                successful,
+                len(targets),
+            )
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Discord client
+# ---------------------------------------------------------------------------
 
 class TranslatorBot(discord.Client):
     def __init__(
         self,
+        config: ConfigStore,
         provider_pool: TranslationProviderPool,
-        config_store: ConfigStore,
     ):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.reactions = True
         intents.guilds = True
-        intents.members = False
+        intents.members = True
+
         super().__init__(intents=intents)
-        self.provider_pool = provider_pool
-        self.config_store = config_store
+
         self.tree = app_commands.CommandTree(self)
-        self.webhooks = WebhookManager(self, config_store)
+        self.config = config
+        self.provider_pool = provider_pool
         self._synced = False
 
     async def setup_hook(self) -> None:
-        if not self._synced:
-            synced_commands = await self.tree.sync()
-            self._synced = True
-            LOGGER.info("Synced %d slash commands", len(synced_commands))
-
-    async def close(self) -> None:
-        await self.provider_pool.close()
-        await super().close()
+        register_commands(self)
 
     async def on_ready(self) -> None:
+        if not self._synced:
+            try:
+                await self.tree.sync()
+                self._synced = True
+                LOGGER.info("Slash commands synced")
+            except Exception:
+                LOGGER.exception("Failed syncing slash commands")
+
         LOGGER.info(
-            "Logged in as %s (guilds=%d)",
+            "Logged in as %s (%s)",
             self.user,
-            len(self.guilds),
+            self.user.id if self.user else "unknown",
         )
 
-    async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.webhook_id:
+    async def on_message(
+        self,
+        message: discord.Message,
+    ) -> None:
+        if message.author.bot:
             return
 
-        try:
-            await self.mirror_message(message)
-            await self.auto_translate_user_message(message)
-        except discord.Forbidden:
-            LOGGER.warning(
-                "Missing Discord permission while mirroring message %s",
-                message.id,
-            )
-        except Exception:
-            LOGGER.exception("Failed to mirror message %s", message.id)
+        if message.webhook_id is not None:
+            return
 
-    async def get_reply_header_for_message(self, message: discord.Message) -> str:
-        """Resolve referenced message and return formatted reply header without translating it."""
-        reference = message.reference
-        if reference is None or reference.message_id is None:
-            return ""
+        if not message.content.strip():
+            return
 
-        referenced_message = reference.cached_message
-        if referenced_message is None:
+        linked = self.config.get_channel(message.channel.id)
+
+        # Same-channel translation for messages not matching channel language.
+        if linked is not None:
             try:
-                referenced_message = await message.channel.fetch_message(
-                    reference.message_id
+                detected = await self.provider_pool.detect_language(
+                    message.content
                 )
-            except (discord.Forbidden, discord.HTTPException):
-                LOGGER.info(
-                    "Unable to resolve reply reference %s for message %s",
-                    reference.message_id,
+            except Exception:
+                detected = None
+                LOGGER.exception(
+                    "Language detection failed for message %s",
                     message.id,
                 )
-                return ""
 
-        return format_reply_header_standalone(referenced_message)
-
-    async def mirror_message(self, message: discord.Message) -> None:
-        if not message.guild:
-            return
-
-        raw_content = message.content
-        if not raw_content.strip():
-            return
-
-        registration = self.config_store.get_channel(message.channel.id)
-        if registration is None:
-            return
-
-        # 1. Detect source language of the incoming message
-        source_language = await self.provider_pool.detect(raw_content)
-        normalized_source = canonical_language(source_language)
-        channel_language = canonical_language(registration.language)
-
-        # 2. Collect ALL channels in the group
-        all_group_channels = self.config_store.get_group(
-            registration.group_name, guild_id=message.guild.id
-        )
-
-        target_channels: list[tuple[LinkedChannel, bool]] = []
-        languages_to_translate: set[str] = set()
-
-        # Check source channel first: Does it need same-channel translation?
-        if normalized_source != channel_language:
-            target_channels.append((registration, True))
-            languages_to_translate.add(channel_language)
-
-        # Check other channels in the group
-        for linked in all_group_channels:
-            if linked.channel_id == registration.channel_id:
-                continue
-
-            target_lang = canonical_language(linked.language)
-            if target_lang == normalized_source:
-                # Same language -> mirror original text directly
-                target_channels.append((linked, False))
-            else:
-                # Different language -> requires translation
-                target_channels.append((linked, True))
-                languages_to_translate.add(target_lang)
-
-        if not target_channels:
-            return
-
-        # 3. Batch translate only for languages that need translation
-        translations: dict[str, str] = {}
-        if languages_to_translate:
-            translations = await self.provider_pool.batch_translate(
-                raw_content, list(languages_to_translate)
-            )
-
-        # 4. Fetch untranslated reply header
-        reply_header = await self.get_reply_header_for_message(message)
-
-        author_name = f"{message.author.display_name} ({source_language})"
-        avatar_url = str(message.author.display_avatar.url)
-
-        # 5. Dispatch messages via webhooks
-        for linked, needs_translation in target_channels:
-            target_lang = canonical_language(linked.language)
-
-            if needs_translation:
-                if target_lang not in translations:
-                    continue
-                body_text = translations[target_lang]
-            else:
-                body_text = raw_content
-
-            target_channel = self.get_channel(linked.channel_id)
-            if not isinstance(target_channel, discord.TextChannel):
+            if (
+                detected
+                and canonical_language(detected)
+                != canonical_language(linked.language)
+            ):
                 try:
-                    fetched_channel = await self.fetch_channel(linked.channel_id)
-                except discord.HTTPException:
-                    LOGGER.warning(
-                        "Unable to fetch target channel %s", linked.channel_id
+                    same_channel_translation = (
+                        await self.provider_pool.translate(
+                            message.content,
+                            linked.language,
+                            source_language=detected,
+                        )
                     )
-                    continue
-                if not isinstance(fetched_channel, discord.TextChannel):
-                    continue
-                target_channel = fetched_channel
+                    await self.send_same_channel_translation(
+                        message,
+                        linked.language,
+                        same_channel_translation,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Same-channel translation failed for message %s",
+                        message.id,
+                    )
 
-            if target_channel.guild.id != message.guild.id:
-                continue
-
-            webhook = await self.webhooks.get_for_channel(
-                target_channel, persisted_url=linked.webhook_url or None
-            )
-
-            final_text = f"{reply_header}{body_text}"
-
-            for chunk in chunk_text(final_text):
-                await webhook.send(
-                    content=chunk,
-                    username=author_name[:80],
-                    avatar_url=avatar_url,
-                    wait=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+            try:
+                await self.mirror_message(message, linked)
+            except Exception:
+                LOGGER.exception(
+                    "Failed to mirror message %s",
+                    message.id,
                 )
 
-    async def auto_translate_user_message(self, message: discord.Message) -> None:
-        target_language = self.config_store.get_user_auto_language(message.author.id)
-        if target_language is None or not message.content.strip():
-            return
-
-        source_language = await self.provider_pool.detect(message.content)
-        if canonical_language(source_language) == canonical_language(target_language):
-            return
-
-        translation = await self.provider_pool.translate(
-            message.content,
-            target_language,
-            source_language=source_language,
+        # Optional personal auto-translation.
+        auto_language = self.config.get_user_auto_language(
+            message.author.id
         )
-        if not isinstance(message.channel, discord.TextChannel):
-            await message.author.send(
-                embed=translation_embed(
-                    translation=translation,
-                    target_language=target_language,
-                    original_message=message,
-                    original_text=message.content,
+        if auto_language:
+            try:
+                translated = await self.provider_pool.translate(
+                    message.content,
+                    auto_language,
                 )
-            )
-            return
-
-        webhook = await self.webhooks.get_for_channel(message.channel, persist=False)
-        for chunk in chunk_text(translation):
-            await webhook.send(
-                content=chunk,
-                username=f"{message.author.display_name} ({source_language})"[:80],
-                avatar_url=str(message.author.display_avatar.url),
-                wait=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+                await self.safe_dm_translation(
+                    message.author,
+                    message,
+                    auto_language,
+                    translated,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "User auto translation failed for %s",
+                    message.author.id,
+                )
 
     async def on_raw_reaction_add(
-        self, payload: discord.RawReactionActionEvent
+        self,
+        payload: discord.RawReactionActionEvent,
     ) -> None:
-        target_language = FLAG_LANGUAGES.get(payload.emoji.name or "")
-        if target_language is None or (
-            self.user is not None and payload.user_id == self.user.id
-        ):
+        if self.user and payload.user_id == self.user.id:
+            return
+
+        target_language = FLAG_LANGUAGES.get(str(payload.emoji))
+        if target_language is None:
             return
 
         channel = self.get_channel(payload.channel_id)
         if channel is None:
             try:
                 channel = await self.fetch_channel(payload.channel_id)
-            except discord.HTTPException:
-                LOGGER.warning("Unable to fetch reacted channel %s", payload.channel_id)
+            except Exception:
                 return
-        if not isinstance(channel, discord.TextChannel):
+
+        if not isinstance(
+            channel,
+            (discord.TextChannel, discord.Thread),
+        ):
             return
 
         try:
             message = await channel.fetch_message(payload.message_id)
-        except discord.HTTPException:
-            LOGGER.warning("Unable to fetch reacted message %s", payload.message_id)
+        except Exception:
+            LOGGER.exception(
+                "Could not fetch reacted message %s",
+                payload.message_id,
+            )
             return
 
-        if message.author.bot or message.webhook_id or not message.content.strip():
+        if not message.content.strip():
             return
+
+        user = self.get_user(payload.user_id)
+        if user is None:
+            try:
+                user = await self.fetch_user(payload.user_id)
+            except Exception:
+                return
 
         try:
-            translation = await self.provider_pool.translate(
-                message.content, target_language
+            translated = await self.provider_pool.translate(
+                message.content,
+                target_language,
             )
-            user = self.get_user(payload.user_id) or await self.fetch_user(
-                payload.user_id
-            )
-            embed = translation_embed(
-                translation=translation,
-                target_language=target_language,
-                original_message=message,
-                original_text=message.content,
-            )
-            await user.send(embed=embed)
-        except discord.Forbidden:
-            LOGGER.info(
-                "Could not DM user %s for flag translation; DMs may be closed",
-                payload.user_id,
+            await self.safe_dm_translation(
+                user,
+                message,
+                target_language,
+                translated,
             )
         except Exception:
-            LOGGER.exception("Failed to translate reaction on message %s", message.id)
-        finally:
-            await self.remove_reaction_if_allowed(message, payload)
+            LOGGER.exception(
+                "Flag reaction translation failed for message %s",
+                message.id,
+            )
 
-    async def remove_reaction_if_allowed(
+    async def safe_dm_translation(
+        self,
+        user: discord.User | discord.Member,
+        source_message: discord.Message,
+        language: str,
+        translated_text: str,
+    ) -> None:
+        parts = chunk_text(translated_text, 1800)
+
+        for index, part in enumerate(parts, start=1):
+            header = (
+                f"**{language} translation**"
+                if len(parts) == 1
+                else f"**{language} translation ({index}/{len(parts)})**"
+            )
+
+            await user.send(
+                f"{header}\n"
+                f"[Original message]({source_message.jump_url})\n\n"
+                f"{part}"
+            )
+
+    async def send_same_channel_translation(
+        self,
+        source_message: discord.Message,
+        language: str,
+        translated_text: str,
+    ) -> None:
+        parts = chunk_text(translated_text, 1800)
+
+        for index, part in enumerate(parts, start=1):
+            prefix = (
+                f"🌐 **{language}:** "
+                if index == 1
+                else ""
+            )
+            await source_message.channel.send(
+                prefix + part,
+                reference=(
+                    source_message
+                    if index == 1
+                    else None
+                ),
+                mention_author=False,
+            )
+
+    async def ensure_webhook(
+        self,
+        linked: LinkedChannel,
+    ) -> str:
+        channel = self.get_channel(linked.channel_id)
+
+        if channel is None:
+            channel = await self.fetch_channel(linked.channel_id)
+
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError(
+                "Linked destination must be a text channel"
+            )
+
+        if linked.webhook_url:
+            try:
+                webhook = discord.Webhook.from_url(
+                    linked.webhook_url,
+                    client=self,
+                )
+                await webhook.fetch()
+                return linked.webhook_url
+            except Exception:
+                LOGGER.warning(
+                    "Stored webhook invalid for channel %s; recreating",
+                    linked.channel_id,
+                )
+
+        webhooks = await channel.webhooks()
+
+        for webhook in webhooks:
+            if (
+                webhook.name == WEBHOOK_NAME
+                and webhook.token
+            ):
+                url = webhook.url
+                await self.config.set_webhook_url(
+                    linked.channel_id,
+                    url,
+                )
+                return url
+
+        webhook = await channel.create_webhook(
+            name=WEBHOOK_NAME,
+            reason="Discord translator channel mirror",
+        )
+
+        await self.config.set_webhook_url(
+            linked.channel_id,
+            webhook.url,
+        )
+
+        return webhook.url
+
+    async def send_mirrored_translation(
+        self,
+        source_message: discord.Message,
+        target: LinkedChannel,
+        translated_text: str,
+    ) -> None:
+        webhook_url = await self.ensure_webhook(target)
+
+        webhook = discord.Webhook.from_url(
+            webhook_url,
+            client=self,
+        )
+
+        avatar_url = (
+            source_message.author.display_avatar.url
+            if source_message.author.display_avatar
+            else None
+        )
+
+        reply_header = ""
+
+        if source_message.reference:
+            resolved = source_message.reference.resolved
+            if isinstance(resolved, discord.Message):
+                reply_header = format_reply_header_standalone(
+                    resolved
+                )
+
+        content = reply_header + translated_text
+        parts = chunk_text(content, MAX_MESSAGE_LENGTH)
+
+        for part in parts:
+            await webhook.send(
+                content=part,
+                username=source_message.author.display_name[:80],
+                avatar_url=avatar_url,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+
+    async def mirror_message(
         self,
         message: discord.Message,
-        payload: discord.RawReactionActionEvent,
+        linked: LinkedChannel | None = None,
     ) -> None:
-        if not message.guild or not isinstance(message.channel, discord.TextChannel):
+        linked = linked or self.config.get_channel(
+            message.channel.id
+        )
+
+        if linked is None:
             return
-        guild_me = message.guild.me
-        if guild_me is None:
+
+        group = self.config.get_group(
+            linked.group_name,
+            guild_id=message.guild.id if message.guild else None,
+        )
+
+        targets = [
+            target
+            for target in group
+            if target.channel_id != message.channel.id
+        ]
+
+        if not targets:
             return
-        permissions = message.channel.permissions_for(guild_me)
-        if not permissions.manage_messages:
-            return
-        try:
-            user = self.get_user(payload.user_id) or await self.fetch_user(
-                payload.user_id
+
+        languages_to_translate = list(
+            dict.fromkeys(
+                target.language
+                for target in targets
+                if canonical_language(target.language)
+                != canonical_language(linked.language)
             )
-            await message.remove_reaction(payload.emoji, user)
-        except (discord.Forbidden, discord.HTTPException):
-            LOGGER.debug("Unable to remove flag reaction from message %s", message.id)
+        )
+
+        translations: dict[str, str] = {}
+
+        if languages_to_translate:
+            translations = await self.provider_pool.batch_translate(
+                message.content,
+                languages_to_translate,
+            )
+
+        # If two linked channels happen to use the same language,
+        # forward the source text as-is instead of translating.
+        translations[
+            canonical_language(linked.language)
+        ] = message.content
+
+        for target in targets:
+            target_language = canonical_language(
+                target.language
+            )
+
+            translated_text = translations.get(
+                target_language
+            )
+
+            if not translated_text:
+                LOGGER.warning(
+                    "Skipping mirror to channel %s because "
+                    "%s translation failed",
+                    target.channel_id,
+                    target.language,
+                )
+                continue
+
+            try:
+                await self.send_mirrored_translation(
+                    message,
+                    target,
+                    translated_text,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Failed sending translation to channel %s",
+                    target.channel_id,
+                )
+
+
+# ---------------------------------------------------------------------------
+# Slash-command helpers
+# ---------------------------------------------------------------------------
+
+async def send_translation_embeds(
+    interaction: discord.Interaction,
+    translated_text: str,
+    language: str,
+) -> None:
+    parts = chunk_text(
+        translated_text,
+        limit=4000,
+    )
+
+    total = len(parts)
+
+    for index, part in enumerate(parts, start=1):
+        if total == 1:
+            title = f"Translation — {language}"
+        else:
+            title = (
+                f"Translation — {language} "
+                f"({index}/{total})"
+            )
+
+        embed = discord.Embed(
+            title=title,
+            description=part,
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+
+def require_guild(
+    interaction: discord.Interaction,
+) -> discord.Guild:
+    if interaction.guild is None:
+        raise app_commands.CheckFailure(
+            "This command can only be used in a server."
+        )
+    return interaction.guild
 
 
 def register_commands(bot: TranslatorBot) -> None:
-    async def send_ephemeral(
+    @bot.tree.command(
+        name="translate",
+        description="Translate text into another language.",
+    )
+    @app_commands.describe(
+        text="Text to translate",
+        language="Target language, e.g. English or Spanish",
+    )
+    async def translate_command(
         interaction: discord.Interaction,
-        content: str,
-        *,
-        embed: discord.Embed | None = None,
+        text: str,
+        language: str,
     ) -> None:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, embed=embed, ephemeral=True)
-        else:
-            await interaction.response.send_message(
-                content, embed=embed, ephemeral=True
-            )
-
-    async def command_error(
-        interaction: discord.Interaction, error: app_commands.AppCommandError
-    ) -> None:
-        if isinstance(error, app_commands.errors.MissingPermissions):
-            await send_ephemeral(
-                interaction,
-                "You need Manage Server permission to change translator configuration.",
-            )
-            return
-        if isinstance(error, app_commands.errors.NoPrivateMessage):
-            await send_ephemeral(
-                interaction,
-                "This command can only be used inside a server.",
-            )
-            return
-        LOGGER.exception("Unhandled slash command error", exc_info=error)
-        await send_ephemeral(
-            interaction,
-            "The command could not be completed. Please try again shortly.",
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
         )
 
-    bot.tree.on_error = command_error
+        try:
+            target = canonical_language(language)
+            translated = await bot.provider_pool.translate(
+                text,
+                target,
+            )
+            await send_translation_embeds(
+                interaction,
+                translated,
+                target,
+            )
+        except Exception as exc:
+            LOGGER.exception("Slash translation failed")
+            await interaction.followup.send(
+                f"Translation failed: `{type(exc).__name__}`",
+                ephemeral=True,
+            )
+
+    @bot.tree.command(
+        name="detect",
+        description="Detect the language of some text.",
+    )
+    @app_commands.describe(
+        text="Text whose language should be detected",
+    )
+    async def detect_command(
+        interaction: discord.Interaction,
+        text: str,
+    ) -> None:
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        try:
+            detected = await bot.provider_pool.detect_language(
+                text
+            )
+            await interaction.followup.send(
+                f"Detected language: **{detected}**",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            LOGGER.exception("Language detection failed")
+            await interaction.followup.send(
+                f"Detection failed: `{type(exc).__name__}`",
+                ephemeral=True,
+            )
 
     @bot.tree.command(
         name="channel-link",
-        description="Link a channel to a dynamic translation group",
+        description="Link this channel to a translation group.",
     )
-    @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.default_permissions(manage_channels=True)
     @app_commands.describe(
-        group="Name of the translation group",
-        language="Language assigned to this channel",
-        channel="Channel to link; defaults to the current channel",
+        group="Name shared by channels that mirror each other",
+        language="Default language for this channel",
     )
     async def channel_link_command(
         interaction: discord.Interaction,
         group: str,
         language: str,
-        channel: discord.TextChannel | None = None,
     ) -> None:
-        target_channel = channel or interaction.channel
-        if (
-            not isinstance(target_channel, discord.TextChannel)
-            or not target_channel.guild
+        guild = require_guild(interaction)
+
+        if not isinstance(
+            interaction.channel,
+            discord.TextChannel,
         ):
-            await send_ephemeral(
-                interaction,
-                "Choose a text channel or run this command in a text channel.",
+            await interaction.response.send_message(
+                "Run this command inside a normal text channel.",
+                ephemeral=True,
             )
             return
 
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        channel = interaction.channel
+        target_language = canonical_language(language)
+
         try:
-            group_name = bot.config_store.normalize_group_name(group)
-            normalized_language = canonical_language(language)
-            existing = bot.config_store.get_channel(target_channel.id)
-            webhook = await bot.webhooks.get_for_channel(
-                target_channel,
-                persisted_url=existing.webhook_url if existing else None,
-                persist=False,
-            )
-            linked = await bot.config_store.link_channel(
-                group_name,
-                target_channel.id,
-                target_channel.guild.id,
-                normalized_language,
-                str(webhook.url),
-            )
-            embed = discord.Embed(
-                title="Channel linked",
-                description=(
-                    f"{target_channel.mention} is now part of **{linked.group_name}**."
+            # Create or reuse the webhook immediately so permission
+            # problems are reported at configuration time.
+            webhooks = await channel.webhooks()
+            webhook = next(
+                (
+                    item
+                    for item in webhooks
+                    if item.name == WEBHOOK_NAME
+                    and item.token
                 ),
-                color=discord.Color.green(),
+                None,
             )
-            embed.add_field(name="Language", value=linked.language)
-            embed.add_field(name="Webhook", value="Active")
-            await send_ephemeral(interaction, "", embed=embed)
-        except (ValueError, discord.Forbidden, discord.HTTPException):
+
+            if webhook is None:
+                webhook = await channel.create_webhook(
+                    name=WEBHOOK_NAME,
+                    reason="Discord translator channel link",
+                )
+
+            linked = await bot.config.link_channel(
+                group_name=group,
+                channel_id=channel.id,
+                guild_id=guild.id,
+                language=target_language,
+                webhook_url=webhook.url,
+            )
+
+            await interaction.followup.send(
+                f"Linked {channel.mention} to **{linked.group_name}** "
+                f"as **{linked.language}**.",
+                ephemeral=True,
+            )
+        except Exception as exc:
             LOGGER.exception("Channel link failed")
-            await send_ephemeral(
-                interaction,
-                "I could not link that channel. Check the group/language values "
-                "and make sure I have Manage Webhooks permission there.",
+            await interaction.followup.send(
+                f"Could not link channel: `{type(exc).__name__}`",
+                ephemeral=True,
             )
 
     @bot.tree.command(
         name="channel-unlink",
-        description="Remove a channel from its translation group",
+        description="Remove this channel from its translation group.",
     )
-    @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.describe(
-        channel="Channel to unlink; defaults to the current channel",
-    )
+    @app_commands.default_permissions(manage_channels=True)
     async def channel_unlink_command(
         interaction: discord.Interaction,
-        channel: discord.TextChannel | None = None,
     ) -> None:
-        target_channel = channel or interaction.channel
-        if not isinstance(target_channel, discord.TextChannel):
-            await send_ephemeral(
-                interaction,
-                "Choose a text channel or run this command in a text channel.",
+        require_guild(interaction)
+
+        if interaction.channel is None:
+            await interaction.response.send_message(
+                "No channel is available.",
+                ephemeral=True,
             )
             return
 
-        removed = await bot.config_store.unlink_channel(target_channel.id)
-        if not removed:
-            await send_ephemeral(
-                interaction,
-                f"{target_channel.mention} is not linked to a translation group.",
-            )
-            return
-
-        groups = ", ".join(sorted({item.group_name for item in removed}))
-        embed = discord.Embed(
-            title="Channel unlinked",
-            description=f"{target_channel.mention} was removed from **{groups}**.",
-            color=discord.Color.orange(),
+        removed = await bot.config.unlink_channel(
+            interaction.channel.id
         )
-        await send_ephemeral(interaction, "", embed=embed)
+
+        if not removed:
+            await interaction.response.send_message(
+                "This channel is not linked.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Channel unlinked from its translation group.",
+            ephemeral=True,
+        )
 
     @bot.tree.command(
         name="channel-groups",
-        description="List active translation channel groups for this server",
+        description="Show translation channel groups in this server.",
     )
-    @app_commands.guild_only()
-    async def channel_groups_command(interaction: discord.Interaction) -> None:
-        guild_id = interaction.guild_id if interaction.guild else None
-        groups = bot.config_store.get_groups(guild_id=guild_id)
-        embed = discord.Embed(
-            title="Active channel groups",
-            description="Dynamic translator routing for this server.",
-            color=discord.Color.blurple(),
-        )
-        if not groups:
-            embed.description = "No channels are linked in this server yet. Use `/channel-link` to begin."
-        else:
-            for group_name, linked_channels in groups.items():
-                lines = [
-                    f"<#{item.channel_id}> · {item.language} · "
-                    f"webhook {'active' if item.webhook_url else 'missing'}"
-                    for item in linked_channels
-                ]
-                value = "\n".join(lines)
-                embed.add_field(
-                    name=group_name,
-                    value=value[:1_024],
-                    inline=False,
-                )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @bot.tree.command(
-        name="translate",
-        description="Translate text into a language",
-    )
-    @app_commands.describe(
-        text="The text to translate",
-        to="Target language, such as Spanish or ja",
-        from_="Optional source language hint",
-    )
-    @app_commands.rename(from_="from")
-    async def translate_command(
+    async def channel_groups_command(
         interaction: discord.Interaction,
-        text: str,
-        to: str,
-        from_: str | None = None,
     ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            target_language = canonical_language(to)
-            translation = await bot.provider_pool.translate(
-                text, target_language, source_language=from_
+        guild = require_guild(interaction)
+        groups = bot.config.get_groups(guild_id=guild.id)
+
+        if not groups:
+            await interaction.response.send_message(
+                "No translation channel groups are configured.",
+                ephemeral=True,
             )
-            embed = translation_embed(
-                translation=translation,
-                target_language=target_language,
-                original_text=text,
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception:
-            LOGGER.exception("Slash translation failed")
+            return
+
+        lines: list[str] = []
+
+        for group_name, channels in groups.items():
+            lines.append(f"**{group_name}**")
+            for linked in channels:
+                lines.append(
+                    f"• <#{linked.channel_id}> — {linked.language}"
+                )
+
+        text = "\n".join(lines)
+        chunks = chunk_text(text, 1900)
+
+        await interaction.response.send_message(
+            chunks[0],
+            ephemeral=True,
+        )
+
+        for chunk in chunks[1:]:
             await interaction.followup.send(
-                "Translation is temporarily unavailable. Please try again shortly.",
+                chunk,
                 ephemeral=True,
             )
 
     @bot.tree.command(
         name="user-auto",
-        description="Automatically translate one user's messages",
+        description="Automatically DM your messages translated into a language.",
     )
-    @app_commands.guild_only()
     @app_commands.describe(
-        language="Language to translate this user's messages into",
-        user="User to configure; defaults to yourself",
+        language="Language you want automatic translations in",
     )
     async def user_auto_command(
         interaction: discord.Interaction,
         language: str,
-        user: discord.Member | None = None,
     ) -> None:
-        target_user = user or interaction.user
-        actor_is_manager = (
-            isinstance(interaction.user, discord.Member)
-            and interaction.user.guild_permissions.manage_guild
+        target = await bot.config.set_user_auto_language(
+            interaction.user.id,
+            language,
         )
-        if target_user.id != interaction.user.id and not actor_is_manager:
-            await send_ephemeral(
-                interaction,
-                "You can only enable auto-translation for yourself unless you "
-                "have Manage Server permission.",
-            )
-            return
 
-        normalized_language = await bot.config_store.set_user_auto_language(
-            target_user.id, language
+        await interaction.response.send_message(
+            f"Automatic translation enabled: **{target}**.",
+            ephemeral=True,
         )
-        embed = discord.Embed(
-            title="User auto-translation enabled",
-            description=(
-                f"{target_user.mention} will be translated into "
-                f"**{normalized_language}** in text channels."
-            ),
-            color=discord.Color.green(),
-        )
-        await send_ephemeral(interaction, "", embed=embed)
 
     @bot.tree.command(
         name="user-stop",
-        description="Disable automatic translation for a user",
-    )
-    @app_commands.guild_only()
-    @app_commands.describe(
-        user="User to configure; defaults to yourself",
+        description="Stop your automatic DM translations.",
     )
     async def user_stop_command(
         interaction: discord.Interaction,
-        user: discord.Member | None = None,
     ) -> None:
-        target_user = user or interaction.user
-        actor_is_manager = (
-            isinstance(interaction.user, discord.Member)
-            and interaction.user.guild_permissions.manage_guild
+        removed = await bot.config.remove_user_auto_language(
+            interaction.user.id
         )
-        if target_user.id != interaction.user.id and not actor_is_manager:
-            await send_ephemeral(
-                interaction,
-                "You can only disable auto-translation for yourself unless you "
-                "have Manage Server permission.",
-            )
-            return
 
-        removed = await bot.config_store.remove_user_auto_language(target_user.id)
         if removed:
-            message = f"Auto-translation disabled for {target_user.mention}."
+            message = "Automatic translation disabled."
         else:
-            message = f"No auto-translation was configured for {target_user.mention}."
-        await send_ephemeral(interaction, message)
+            message = "Automatic translation was not enabled."
 
-    @bot.tree.command(
-        name="detect",
-        description="Detect the primary language of text",
-    )
-    @app_commands.describe(text="The text whose language should be detected")
-    async def detect_command(
-        interaction: discord.Interaction,
-        text: str,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            language = await bot.provider_pool.detect(text)
-            embed = discord.Embed(
-                title="Language detected",
-                description=f"**{language}**",
-                color=discord.Color.teal(),
-            )
-            embed.add_field(name="Text", value=clipped_embed_text(text))
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception:
-            LOGGER.exception("Slash detection failed")
-            await interaction.followup.send(
-                "Language detection is temporarily unavailable. Please try again shortly.",
-                ephemeral=True,
-            )
-    @bot.tree.command(
-        name="status", description="Check the status of Storm Translator."
-    )
-    async def status_command(interaction: discord.Interaction) -> None:
-        import random
-
-        messages = [
-            "Online, active, and keeping our channels connected in memory of Storm ❤️",
-            "Good dogs leave paw prints on our hearts forever. Ready to translate!",
-            "Translating across channels to keep everyone together—just like a good companion 🐾",
-            "Storm Translator is online and watching over all server conversations ✨",
-            "Keeping all our language channels linked in honor of Storm 💙",
-            "Always here, bridging languages and bringing people closer in Storm's memory 🐶",
-            "A loyal companion for all our server conversations, active and ready!",
-            "Forever part of our community—Storm Translator is online and connected 🌟",
-            "Running smoothly and keeping every channel in sync for everyone ❤️",
-        ]
-        selected_message = random.choice(messages)
-        embed = discord.Embed(
-            title="🐾 Storm Translator",
-            description=selected_message,
-            color=discord.Color.blue(),
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
         )
-        embed.set_footer(text="Translating messages across all server channels.")
-        await interaction.response.send_message(embed=embed)
 
 
-
-
-
-
-def build_bot() -> TranslatorBot:
-    token = required_env("DISCORD_BOT_TOKEN")
-    gemini_keys = parse_gemini_keys()
-    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
-    config_store = ConfigStore(CONFIG_PATH)
-    provider_pool = TranslationProviderPool(gemini_keys, groq_api_key)
-    bot = TranslatorBot(provider_pool, config_store)
-    register_commands(bot)
-    bot._translator_token = token  # type: ignore[attr-defined]
-    return bot
-
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    bot = build_bot()
-    token = bot._translator_token  # type: ignore[attr-defined]
-    try:
-        bot.run(token, log_handler=None)
-    except KeyboardInterrupt:
-        LOGGER.info("Shutdown requested")
+    discord_token = required_env("DISCORD_BOT_TOKEN")
+    gemini_keys = parse_gemini_keys()
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+
+    if not gemini_keys and not groq_api_key:
+        raise RuntimeError(
+            "Configure GEMINI_API_KEYS/GEMINI_API_KEY "
+            "or GROQ_API_KEY."
+        )
+
+    config = ConfigStore(CONFIG_PATH)
+
+    providers = TranslationProviderPool(
+        gemini_keys=gemini_keys,
+        groq_api_key=groq_api_key,
+    )
+
+    bot = TranslatorBot(
+        config=config,
+        provider_pool=providers,
+    )
+
+    bot.run(
+        discord_token,
+        log_handler=None,
+    )
 
 
 if __name__ == "__main__":
