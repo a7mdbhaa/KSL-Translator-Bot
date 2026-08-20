@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
-
+import random
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -586,4 +586,4 @@ Text to translate:
 Return exactly this JSON shape:
 {{"translations":[{{"language":"<one requested language>","text":"<translation>"}}, ...]}}
 
-Include one object for every reques
+Include one object for
